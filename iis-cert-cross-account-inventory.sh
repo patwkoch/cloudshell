@@ -3,7 +3,7 @@ set -u
 
 REGION="us-east-1"
 HOME_ACCOUNT="472466695190"
-ROLE_NAME="EC2-Weekly-WindowsFleetReport"
+ROLE_NAME="EC2-Restart-Orchestrator-Role"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 REPORT="iis-cert-cross-account-${TIMESTAMP}.csv"
 
