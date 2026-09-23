@@ -14,7 +14,7 @@ ACCOUNTS=(
   "PROD|472466695190"
 )
 
-echo '"Environment","AccountId","InstanceId","Server","Binding","Subject","Thumbprint","Expiration","DaysRemaining","Status"' > "$REPORT"
+echo '"Environment","AccountId","InstanceId","Hostname","Binding","Subject","Template","Thumbprint","Expiration","DaysRemaining","Status"' > "$REPORT"
 
 CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
 echo "Current AWS account: $CURRENT_ACCOUNT"
@@ -36,6 +36,9 @@ run_aws() {
 for ENTRY in "${ACCOUNTS[@]}"; do
   ENVIRONMENT="${ENTRY%%|*}"
   ACCOUNT_ID="${ENTRY##*|}"
+  # Excel opens CSV numeric-looking fields as numbers even when CSV-quoted.
+  # This constant text formula preserves the fixed, trusted 12-digit account ID.
+  ACCOUNT_ID_CSV="\"=\"\"${ACCOUNT_ID}\"\"\""
   USE_ASSUMED="false"
 
   echo
@@ -51,7 +54,7 @@ for ENTRY in "${ACCOUNTS[@]}"; do
       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
       --output text 2>/dev/null) || {
         echo "ERROR: Unable to assume role in $ACCOUNT_ID"
-        echo "\"$ENVIRONMENT\",\"$ACCOUNT_ID\",\"\",\"\",\"\",\"ASSUME ROLE FAILED\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+        echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"ASSUME ROLE FAILED\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
         continue
       }
     read -r ASSUMED_ACCESS_KEY ASSUMED_SECRET_KEY ASSUMED_SESSION_TOKEN <<< "$CREDS"
@@ -82,27 +85,56 @@ for ENTRY in "${ACCOUNTS[@]}"; do
     --comment "Read-only IIS HTTPS certificate inventory" \
     --parameters 'commands=[
 "Import-Module WebAdministration -ErrorAction SilentlyContinue",
-"if (-not (Get-Module WebAdministration)) { Write-Output \"NO_IIS\"; exit 0 }",
+"if (-not (Get-Module WebAdministration)) { [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_IIS\"} | ConvertTo-Csv -NoTypeInformation; exit 0 }",
+"# Prefer v2 template information, then the legacy template-name extension.",
+"function Get-InventoryTemplate($Cert) {",
+" $Fallback=\"UNKNOWN\"",
+" foreach ($Oid in @(\"1.3.6.1.4.1.311.21.7\",\"1.3.6.1.4.1.311.20.2\")) {",
+"  foreach ($Ext in @($Cert.Extensions | Where-Object { $_.Oid.Value -eq $Oid })) {",
+"   try { $Text=$Ext.Format($false).Trim() } catch { continue }",
+"   if (-not $Text) { continue }",
+"   # Resolve known fleet template OIDs even when Windows cannot resolve their names.",
+"   if ($Text -match \"1\\.3\\.6\\.1\\.4\\.1\\.311\\.21\\.8\\.10987005\\.6455535\\.6243231\\.9307925\\.11114365\\.15\\.961358\\.10389579(?![\\d.])\") { return \"Standard SSL Certificate\" }",
+"   if ($Text -match \"1\\.3\\.6\\.1\\.4\\.1\\.311\\.21\\.8\\.10987005\\.6455535\\.6243231\\.9307925\\.11114365\\.15\\.7040614\\.1412261(?![\\d.])\") { return \"Serco CMS Web Server\" }",
+"   $Name=$Text",
+"   if ($Text -match \"Template\\s*=\\s*([^\\r\\n,]+)\") { $Name=$Matches[1].Trim() }",
+"   elseif ($Oid -eq \"1.3.6.1.4.1.311.21.7\") { $Fallback=$Text; continue }",
+"   $Name=($Name -replace \"\\s*\\([\\d.]+\\)\\s*$\",\"\").Trim()",
+"   switch -Regex ($Name) {",
+"    \"^Standard\\s*SSL\\s*Certificate$\" { return \"Standard SSL Certificate\" }",
+"    \"^Web\\s*Server$\" { return \"WebServer\" }",
+"    \"^Serco\\s*CMS\\s*Web\\s*Server$\" { return \"Serco CMS Web Server\" }",
+"   }",
+"   if ($Name -match \"^\\d+(\\.\\d+)+$\") { $Fallback=$Name; continue }",
+"   if ($Name) { return $Name }",
+"  }",
+" }",
+" return $Fallback",
+"}",
+"# Single-status precedence: EXPIRED, MISSING_CN, RENEW_SOON, LEGACY_TEMPLATE, OK.",
+"# Unrecognized templates retain their name/OID; only known legacy templates are flagged.",
 "$Now=Get-Date",
 "$Results=Get-WebBinding -Protocol https | ForEach-Object {",
 " $Binding=$_",
-" $Hash=($Binding.CertificateHash -replace \" \",\"\").ToUpper()",
+" $Hash=if ($Binding.CertificateHash -is [byte[]]) { ([BitConverter]::ToString($Binding.CertificateHash)).Replace(\"-\",\"\") } else { ([string]$Binding.CertificateHash -replace \"\\s\",\"\").ToUpperInvariant() }",
 " if (-not $Hash) { return }",
 " $Cert=Get-ChildItem Cert:\\LocalMachine\\My | Where-Object { ($_.Thumbprint -replace \" \",\"\").ToUpper() -eq $Hash } | Select-Object -First 1",
 " if ($Cert) {",
 "  $Days=[math]::Floor(($Cert.NotAfter-$Now).TotalDays)",
-"  $Status=if($Days -lt 0){\"EXPIRED\"}elseif($Days -le 30){\"CRITICAL\"}elseif($Days -le 60){\"WARNING\"}elseif($Days -le 90){\"RENEW_SOON\"}else{\"OK\"}",
-"  [PSCustomObject]@{Server=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=$Cert.Subject;Thumbprint=$Cert.Thumbprint;Expiration=$Cert.NotAfter.ToString(\"yyyy-MM-dd HH:mm:ss\");DaysRemaining=$Days;Status=$Status}",
+"  $Template=Get-InventoryTemplate $Cert",
+"  $HasCN=$Cert.Subject -match \"(?:^|,|;)\\s*CN\\s*=\\s*[^\\s,;]+\"",
+"  $Status=if($Cert.NotAfter -le $Now){\"EXPIRED\"}elseif(-not $HasCN){\"MISSING_CN\"}elseif($Days -le 90){\"RENEW_SOON\"}elseif($Template -in @(\"WebServer\",\"Serco CMS Web Server\")){\"LEGACY_TEMPLATE\"}else{\"OK\"}",
+"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=$Cert.Subject;Template=$Template;Thumbprint=$Cert.Thumbprint;Expiration=$Cert.NotAfter.ToString(\"yyyy-MM-dd HH:mm:ss\");DaysRemaining=$Days;Status=$Status}",
 " } else {",
-"  [PSCustomObject]@{Server=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=\"CERTIFICATE NOT FOUND\";Thumbprint=$Hash;Expiration=\"\";DaysRemaining=\"\";Status=\"ERROR\"}",
+"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=\"CERTIFICATE NOT FOUND\";Template=\"UNKNOWN\";Thumbprint=$Hash;Expiration=\"\";DaysRemaining=\"\";Status=\"ORPHANED_BINDING\"}",
 " }",
 "}",
-"if($Results){$Results | ConvertTo-Csv -NoTypeInformation}else{Write-Output \"NO_HTTPS_BINDINGS\"}"
+"if($Results){$Results | ConvertTo-Csv -NoTypeInformation}else{[PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_HTTPS_BINDINGS\"} | ConvertTo-Csv -NoTypeInformation}"
 ]' \
     --query 'Command.CommandId' \
     --output text 2>/dev/null) || {
       echo "ERROR: Unable to submit SSM command."
-      echo "\"$ENVIRONMENT\",\"$ACCOUNT_ID\",\"\",\"\",\"\",\"SEND COMMAND FAILED\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"SEND COMMAND FAILED\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
       continue
     }
 
@@ -131,7 +163,7 @@ for ENTRY in "${ACCOUNTS[@]}"; do
       --output json 2>/dev/null || true)
 
     if [ -z "$INVOCATION" ]; then
-      echo "\"$ENVIRONMENT\",\"$ACCOUNT_ID\",\"$ID\",\"\",\"\",\"NO INVOCATION RESULT\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"NO INVOCATION RESULT\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
       continue
     fi
 
@@ -140,15 +172,15 @@ for ENTRY in "${ACCOUNTS[@]}"; do
 
     if [ "$STATUS" != "Success" ]; then
       ERR=$(echo "$INVOCATION" | jq -r '.StandardErrorContent // ""' | tr '\n' ' ' | sed 's/"/""/g')
-      echo "\"$ENVIRONMENT\",\"$ACCOUNT_ID\",\"$ID\",\"\",\"\",\"SSM COMMAND FAILED\",\"\",\"\",\"\",\"$STATUS: $ERR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"SSM COMMAND FAILED\",\"\",\"\",\"\",\"\",\"$STATUS: $ERR\"" >> "$REPORT"
       continue
     fi
 
     if echo "$OUTPUT" | grep -q '^NO_IIS$'; then continue; fi
     if echo "$OUTPUT" | grep -q '^NO_HTTPS_BINDINGS$'; then continue; fi
 
-    echo "$OUTPUT" | grep -v '^"Server"' | sed '/^[[:space:]]*$/d' | while IFS= read -r LINE; do
-      echo "\"$ENVIRONMENT\",\"$ACCOUNT_ID\",\"$ID\",$LINE" >> "$REPORT"
+    echo "$OUTPUT" | grep -v '^"Hostname"' | sed '/^[[:space:]]*$/d' | while IFS= read -r LINE; do
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",$LINE" >> "$REPORT"
     done
   done
 done
@@ -159,8 +191,19 @@ echo " CROSS-ACCOUNT REPORT COMPLETE"
 echo "======================================================"
 echo "Report: $REPORT"
 echo
-echo "Certificates requiring attention (<=90 days or error):"
-awk -F',' 'NR==1{print;next}{s=$10;gsub(/"/,"",s);if(s=="EXPIRED"||s=="CRITICAL"||s=="WARNING"||s=="RENEW_SOON"||s=="ERROR"||s ~ /Failed|FAILED/)print}' "$REPORT"
+echo "Certificates requiring attention (expiration, template, CN, orphaned binding, or error):"
+python3 - "$REPORT" <<'PYCSV'
+import csv
+import sys
+
+with open(sys.argv[1], newline="", encoding="utf-8-sig") as report:
+    rows = csv.DictReader(report)
+    writer = csv.DictWriter(sys.stdout, fieldnames=rows.fieldnames)
+    writer.writeheader()
+    for row in rows:
+        if row["Status"] not in {"OK", "NO_IIS", "NO_HTTPS_BINDINGS"}:
+            writer.writerow(row)
+PYCSV
 echo
 echo "Full report:"
 cat "$REPORT"
