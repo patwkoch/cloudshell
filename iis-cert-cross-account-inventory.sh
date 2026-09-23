@@ -14,7 +14,7 @@ ACCOUNTS=(
   "PROD|472466695190"
 )
 
-echo '"Environment","AccountId","InstanceId","Hostname","Binding","Subject","Template","Thumbprint","Expiration","DaysRemaining","Status"' > "$REPORT"
+echo '"Environment","AccountId","InstanceId","Hostname","Binding","Subject","DNSNames","Template","Thumbprint","Expiration","DaysRemaining","Status"' > "$REPORT"
 
 CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
 echo "Current AWS account: $CURRENT_ACCOUNT"
@@ -54,7 +54,7 @@ for ENTRY in "${ACCOUNTS[@]}"; do
       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
       --output text 2>/dev/null) || {
         echo "ERROR: Unable to assume role in $ACCOUNT_ID"
-        echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"ASSUME ROLE FAILED\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+        echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"ASSUME ROLE FAILED\",\"\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
         continue
       }
     read -r ASSUMED_ACCESS_KEY ASSUMED_SECRET_KEY ASSUMED_SESSION_TOKEN <<< "$CREDS"
@@ -85,7 +85,7 @@ for ENTRY in "${ACCOUNTS[@]}"; do
     --comment "Read-only IIS HTTPS certificate inventory" \
     --parameters 'commands=[
 "Import-Module WebAdministration -ErrorAction SilentlyContinue",
-"if (-not (Get-Module WebAdministration)) { [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_IIS\"} | ConvertTo-Csv -NoTypeInformation; exit 0 }",
+"if (-not (Get-Module WebAdministration)) { [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";DNSNames=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_IIS\"} | ConvertTo-Csv -NoTypeInformation; exit 0 }",
 "# Prefer v2 template information, then the legacy template-name extension.",
 "function Get-InventoryTemplate($Cert) {",
 " $Fallback=\"UNKNOWN\"",
@@ -124,17 +124,22 @@ for ENTRY in "${ACCOUNTS[@]}"; do
 "  $Template=Get-InventoryTemplate $Cert",
 "  $HasCN=$Cert.Subject -match \"(?:^|,|;)\\s*CN\\s*=\\s*[^\\s,;]+\"",
 "  $Status=if($Cert.NotAfter -le $Now){\"EXPIRED\"}elseif(-not $HasCN){\"MISSING_CN\"}elseif($Days -le 90){\"RENEW_SOON\"}elseif($Template -in @(\"WebServer\",\"Serco CMS Web Server\")){\"LEGACY_TEMPLATE\"}else{\"OK\"}",
-"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=$Cert.Subject;Template=$Template;Thumbprint=$Cert.Thumbprint;Expiration=$Cert.NotAfter.ToString(\"yyyy-MM-dd HH:mm:ss\");DaysRemaining=$Days;Status=$Status}",
+"  # Decode RDN boundaries instead of splitting commas inside quoted subject values.",
+"  $Subject=$Cert.SubjectName.Decode([System.Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseNewLines -bor [System.Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::Reversed).Trim()",
+"  # DNS names from the SAN extension only; do not substitute the Subject CN.",
+"  $DNSNames=\"\"",
+"  if ($Cert.Extensions | Where-Object { $_.Oid.Value -eq \"2.5.29.17\" }) { $DNSNames=(@($Cert.DnsNameList | ForEach-Object { $_.Unicode } | Where-Object { $_ } | Select-Object -Unique) -join \"`n\") }",
+"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=$Subject;DNSNames=$DNSNames;Template=$Template;Thumbprint=$Cert.Thumbprint;Expiration=$Cert.NotAfter.ToString(\"yyyy-MM-dd HH:mm:ss\");DaysRemaining=$Days;Status=$Status}",
 " } else {",
-"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=\"CERTIFICATE NOT FOUND\";Template=\"UNKNOWN\";Thumbprint=$Hash;Expiration=\"\";DaysRemaining=\"\";Status=\"ORPHANED_BINDING\"}",
+"  [PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=$Binding.BindingInformation;Subject=\"CERTIFICATE NOT FOUND\";DNSNames=\"\";Template=\"UNKNOWN\";Thumbprint=$Hash;Expiration=\"\";DaysRemaining=\"\";Status=\"ORPHANED_BINDING\"}",
 " }",
 "}",
-"if($Results){$Results | ConvertTo-Csv -NoTypeInformation}else{[PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_HTTPS_BINDINGS\"} | ConvertTo-Csv -NoTypeInformation}"
+"if($Results){$Results | ConvertTo-Csv -NoTypeInformation}else{[PSCustomObject]@{Hostname=$env:COMPUTERNAME;Binding=\"\";Subject=\"\";DNSNames=\"\";Template=\"\";Thumbprint=\"\";Expiration=\"\";DaysRemaining=\"\";Status=\"NO_HTTPS_BINDINGS\"} | ConvertTo-Csv -NoTypeInformation}"
 ]' \
     --query 'Command.CommandId' \
     --output text 2>/dev/null) || {
       echo "ERROR: Unable to submit SSM command."
-      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"SEND COMMAND FAILED\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"\",\"\",\"\",\"SEND COMMAND FAILED\",\"\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
       continue
     }
 
@@ -163,7 +168,7 @@ for ENTRY in "${ACCOUNTS[@]}"; do
       --output json 2>/dev/null || true)
 
     if [ -z "$INVOCATION" ]; then
-      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"NO INVOCATION RESULT\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"NO INVOCATION RESULT\",\"\",\"\",\"\",\"\",\"\",\"ERROR\"" >> "$REPORT"
       continue
     fi
 
@@ -172,16 +177,29 @@ for ENTRY in "${ACCOUNTS[@]}"; do
 
     if [ "$STATUS" != "Success" ]; then
       ERR=$(echo "$INVOCATION" | jq -r '.StandardErrorContent // ""' | tr '\n' ' ' | sed 's/"/""/g')
-      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"SSM COMMAND FAILED\",\"\",\"\",\"\",\"\",\"$STATUS: $ERR\"" >> "$REPORT"
+      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",\"\",\"\",\"SSM COMMAND FAILED\",\"\",\"\",\"\",\"\",\"\",\"$STATUS: $ERR\"" >> "$REPORT"
       continue
     fi
 
-    if echo "$OUTPUT" | grep -q '^NO_IIS$'; then continue; fi
-    if echo "$OUTPUT" | grep -q '^NO_HTTPS_BINDINGS$'; then continue; fi
+    # Parse complete CSV records: Subject and DNSNames contain in-cell newlines.
+    printf '%s\n' "$OUTPUT" | python3 -c '
+import csv
+import sys
 
-    echo "$OUTPUT" | grep -v '^"Hostname"' | sed '/^[[:space:]]*$/d' | while IFS= read -r LINE; do
-      echo "\"$ENVIRONMENT\",$ACCOUNT_ID_CSV,\"$ID\",$LINE" >> "$REPORT"
-    done
+rows = csv.reader(sys.stdin, strict=True)
+header = next(rows, [])
+expected = ["Hostname", "Binding", "Subject", "DNSNames", "Template", "Thumbprint", "Expiration", "DaysRemaining", "Status"]
+if header != expected:
+    raise ValueError("Unexpected SSM CSV header: " + repr(header))
+writer = csv.writer(sys.stdout, quoting=csv.QUOTE_ALL, lineterminator="\n")
+for row in rows:
+    if not row:
+        continue
+    if len(row) != len(expected):
+        raise ValueError("Incomplete SSM CSV record")
+    writer.writerow([sys.argv[1], "=\"" + sys.argv[2] + "\"", sys.argv[3]] + row)
+' "$ENVIRONMENT" "$ACCOUNT_ID" "$ID" >> "$REPORT"
+
   done
 done
 
